@@ -1,0 +1,138 @@
+import { NextResponse } from 'next/server';
+import { createClient } from '../../../utils/supabase/server';
+import { GoogleGenAI } from '@google/genai';
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY_1 });
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+}
+
+export async function POST(request: Request) {
+  try {
+    const { message } = await request.json();
+    if (!message) return NextResponse.json({ error: 'No message' }, { status: 400 });
+
+    const apiKey = (process.env.GEMINI_API_KEY_1 || '').trim();
+    const supabase = await createClient();
+
+    // 1. Embed the question
+    const queryClean = message.replace(/[^\x00-\x7F]/g, "").trim().slice(0, 2000);
+    const embRes = await ai.models.embedContent({
+      model: 'gemini-embedding-001',
+      contents: queryClean,
+      config: { outputDimensionality: 768 },
+    });
+    const queryVector = (embRes as any).embedding?.values || (embRes as any).embeddings?.[0]?.values;
+    if (!queryVector) throw new Error('Failed to embed query');
+
+    // 2. Fetch all chunks with their file names
+    const { data: allChunks, error } = await supabase
+     .from('chunks')
+     .select('id, content, document_id, documents(file_name)')
+     .limit(500);
+
+    if (error) throw new Error(error.message);
+    if (!allChunks || allChunks.length === 0) {
+      return NextResponse.json({ reply: "No documents uploaded yet. Upload something first!" });
+    }
+
+    // 3. Score by similarity + boost if user mentioned file name
+    const lowerMessage = message.toLowerCase();
+    const scored = allChunks
+     .filter((c: any) => c.embedding || true) // we need embedding column
+     .map((c: any) => {
+        // If embedding missing in select, fetch again with embedding
+        return c;
+      });
+
+    // Re-fetch with embeddings because first select missed it
+    const { data: chunksWithEmb } = await supabase.from('chunks').select('id, content, embedding, document_id, documents(file_name)').limit(500);
+
+    const ranked = (chunksWithEmb || [])
+     .map((c: any) => {
+        let score = 0;
+        try {
+          if (c.embedding) score = cosineSimilarity(queryVector, c.embedding);
+        } catch {}
+        // Boost if file name is mentioned in question
+        const fileName = (c.documents?.file_name || '').toLowerCase();
+        if (fileName && lowerMessage.includes(fileName.replace('.docx','').replace('.pdf','').replace('.rtf','').split(' ')[0])) {
+          score += 0.3;
+        }
+        if (lowerMessage.includes('fokam') && fileName.includes('fokam')) score += 0.5;
+        if (lowerMessage.includes('cv') && fileName.includes('cv')) score += 0.5;
+        if (lowerMessage.includes('invoice') && fileName.includes('invoice')) score += 0.5;
+        if (lowerMessage.includes('aws') && fileName.includes('aws')) score += 0.5;
+
+        return {...c, score, fileName: c.documents?.file_name || 'unknown' };
+      })
+     .sort((a: any, b: any) => b.score - a.score)
+     .slice(0, 12);
+
+    let contextText = ranked.map((r: any) => `[FILE: ${r.fileName} | Score: ${r.score.toFixed(3)}]\n${r.content}`).join('\n\n---\n\n');
+    if (contextText.length > 15000) contextText = contextText.slice(0, 15000);
+
+    console.log(`[RAG] Query: "${message}" -> Top file: ${ranked[0]?.fileName} score ${ranked[0]?.score.toFixed(3)}`);
+
+    const systemPrompt = `You are CAISY Brain - Second Brain.
+RULES:
+1. Use ONLY the context below. Context shows [FILE: name] for each chunk.
+2. If user mentions a file name (fokam, cv, invoice, aws), prioritize chunks from that file.
+3. Always say which file you used: "According to FILE_NAME..."
+4. If context doesn't contain answer, say "I don't see that in your uploaded docs" and list what files you have.
+5. Be concise, bullet points.
+
+CONTEXT:
+${contextText}
+
+QUESTION: ${message}`;
+
+    // 4. Model fallback loop - uses ONLY alive models
+    const modelsToTry = [
+      "gemini-flash-lite-latest",
+      "gemini-flash-latest",
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+    ];
+
+    for (const modelName of modelsToTry) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: systemPrompt }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 2048 }
+          })
+        });
+        const txt = await res.text();
+        if (!res.ok) {
+          console.log(`${modelName} failed: ${txt.slice(0,300)}`);
+          continue;
+        }
+        const data = JSON.parse(txt);
+        const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (reply) {
+          console.log(`SUCCESS with ${modelName}`);
+          return NextResponse.json({ reply, modelUsed: modelName, contextUsed: ranked.map(r=>({file: r.fileName, score: r.score})) });
+        }
+      } catch (e: any) {
+        console.log(`${modelName} error: ${e.message}`);
+        continue;
+      }
+    }
+
+    throw new Error("All models busy - wait 1 min and retry");
+  } catch (e: any) {
+    console.error("[RESPONSE-GEN ERROR]", e);
+    return NextResponse.json({ error: e.message }, { status: 500 });
+  }
+}

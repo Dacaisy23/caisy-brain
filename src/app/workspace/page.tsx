@@ -83,7 +83,7 @@ export default function WorkspacePage() {
         const audioBlob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType || 'audio/wav' });
         setChatMessages((prev) => [
           ...prev,
-          { role: 'user', text: `🎙️ Voice Note Captured (${audioBlob.size} bytes). Context active locally.` }
+          { role: 'user', text: `🎙️ Voice Note Captured (${audioBlob.size} bytes). Uploading to Supabase...` }
         ]);
         stream.getTracks().forEach(track => track.stop());
       };
